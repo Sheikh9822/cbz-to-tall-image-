@@ -1,72 +1,86 @@
-import zipfile
-import os
+from flask import Flask, request, send_file, render_template_string
+import os, zipfile, shutil
 from PIL import Image
+from datetime import datetime
 from math import ceil
 
-# === CONFIGURATION ===
-zip_path = "test.zip"          # Path to input zip
-temp_dir = "temp_images"
-output_dir = "output_pages"
-final_zip = "output_pages.zip"
-page_quality = 100                    # Max image quality
-margin = 20                           # Margin in pixels between images
+app = Flask(__name__)
+UPLOAD_FOLDER = "uploads"
+OUTPUT_FOLDER = "output"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# === UNZIP IMAGES ===
-with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-    zip_ref.extractall(temp_dir)
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "POST":
+        file = request.files.get("cbz")
+        if not file or not file.filename.endswith(".cbz"):
+            return "<h3>❌ Please upload a valid .cbz file.</h3>"
 
-# === LOAD IMAGES ===
-image_files = sorted([
-    f for f in os.listdir(temp_dir)
-    if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
-])
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        session_dir = os.path.join(UPLOAD_FOLDER, f"session_{timestamp}")
+        os.makedirs(session_dir, exist_ok=True)
 
-os.makedirs(output_dir, exist_ok=True)
+        cbz_path = os.path.join(session_dir, "input.cbz")
+        file.save(cbz_path)
 
-# === PAGE GENERATOR ===
-def create_custom_page(img_paths, page_num):
-    # Load images or use blank filler
-    images = [Image.open(os.path.join(temp_dir, path)).convert('RGB') for path in img_paths]
-    while len(images) < 4:
-        images.append(Image.new('RGB', (1, 1), (255, 255, 255)))
+        extract_dir = os.path.join(session_dir, "extracted")
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(cbz_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_dir)
 
-    # Calculate dimensions with margins
-    w_left = max(images[2].width, images[3].width)
-    w_right = max(images[0].width, images[1].width)
-    h_top = max(images[2].height, images[0].height)
-    h_bottom = max(images[3].height, images[1].height)
+        image_files = sorted([
+            f for f in os.listdir(extract_dir)
+            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+        ])
+        if not image_files:
+            return "<h3>❌ No valid image files found in CBZ.</h3>"
 
-    total_width = w_left + w_right + margin
-    total_height = h_top + h_bottom + margin
+        images = [Image.open(os.path.join(extract_dir, f)).convert("RGB") for f in image_files]
+        margin = 20
+        images_per_group = 10
+        total_groups = ceil(len(images) / images_per_group)
 
-    canvas = Image.new('RGB', (total_width, total_height), (255, 255, 255))
+        tall_outputs = []
+        for i in range(total_groups):
+            group = images[i * images_per_group:(i + 1) * images_per_group]
+            max_width = max(img.width for img in group)
+            total_height = sum(img.height for img in group) + margin * (len(group) - 1)
 
-    # Positions based on your layout
-    positions = {
-        0: (w_left + margin, 0),           # Image 1 → top-right
-        1: (w_left + margin, h_top + margin),  # Image 2 → bottom-right
-        2: (0, 0),                         # Image 3 → top-left
-        3: (0, h_top + margin),           # Image 4 → bottom-left
-    }
+            tall_image = Image.new("RGB", (max_width, total_height), (255, 255, 255))
+            y_offset = 0
+            for img in group:
+                tall_image.paste(img, (0, y_offset))
+                y_offset += img.height + margin
 
-    for i, img in enumerate(images):
-        x, y = positions[i]
-        canvas.paste(img, (x, y))
+            out_name = f"tall_{i+1:03}.jpg"
+            out_path = os.path.join(session_dir, out_name)
+            tall_image.save(out_path, quality=100, subsampling=0)
+            tall_outputs.append((out_name, out_path))
 
-    # Save with high quality
-    out_path = os.path.join(output_dir, f"page_{page_num:03d}.jpg")
-    canvas.save(out_path, quality=page_quality, subsampling=0)
+        # Save ZIP and CBZ
+        zip_basename = f"output_{timestamp}"
+        zip_path = os.path.join(OUTPUT_FOLDER, f"{zip_basename}.zip")
+        cbz_path = os.path.join(OUTPUT_FOLDER, f"{zip_basename}.cbz")
 
-# === PROCESS IN GROUPS OF 4 ===
-total_pages = ceil(len(image_files) / 4)
-for i in range(total_pages):
-    chunk = image_files[i*4:(i+1)*4]
-    create_custom_page(chunk, i+1)
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for name, path in tall_outputs:
+                zipf.write(path, arcname=name)
 
-# === ZIP OUTPUT PAGES ===
-with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
-    for file_name in sorted(os.listdir(output_dir)):
-        file_path = os.path.join(output_dir, file_name)
-        zipf.write(file_path, arcname=file_name)
+        shutil.copy(zip_path, cbz_path)
 
-print(f"✅ All {total_pages} pages saved and zipped as '{final_zip}'!")
+        # Show download links
+        return render_template_string(f"""
+        <h2>✅ Done! Your files are ready:</h2>
+        <p><a href="/download/{zip_basename}.zip">📦 Download ZIP</a></p>
+        <p><a href="/download/{zip_basename}.cbz">📘 Download CBZ</a></p>
+        """)
+
+    return open("index.html", "r", encoding="utf-8").read()
+
+@app.route("/download/<filename>")
+def download_file(filename):
+    file_path = os.path.join(OUTPUT_FOLDER, filename)
+    if os.path.exists(file_path):
+        return send_file(file_path, as_attachment=True)
+    return "❌ File not found", 404
